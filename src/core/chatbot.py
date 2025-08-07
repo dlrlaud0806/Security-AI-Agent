@@ -1,36 +1,36 @@
 from typing import Dict, Any, List
-#from langchain_openai import ChatOpenAI
-from langchain_mistralai import ChatMistralAI
+from langchain_openai import ChatOpenAI
+# from langchain_mistralai import ChatMistralAI
 from langchain.schema import HumanMessage, AIMessage, SystemMessage
 from langchain_community.chat_message_histories import ChatMessageHistory
 from ..config.settings import settings
 
-#vdi
-import ssl
-import httpx
-# SSL 검증 비활성화
-ssl_context = ssl.create_default_context()
-ssl_context.check_hostname = False
-ssl_context.verify_mode = ssl.CERT_NONE
+# #vdi
+# import ssl
+# import httpx
+# # SSL 검증 비활성화
+# ssl_context = ssl.create_default_context()
+# ssl_context.check_hostname = False
+# ssl_context.verify_mode = ssl.CERT_NONE
 
 # httpx 클라이언트 설정
-skipsslclient = httpx.Client(verify=False)
+# skipsslclient = httpx.Client(verify=False)
 
 class Chatbot:
     def __init__(self, system_prompt: str = "You are a helpful AI assistant."):
-        # self.llm = ChatOpenAI(
-        #     openai_api_key=settings.openai_api_key,
-        #     model_name=settings.model_name,
-        #     temperature=settings.temperature,
-        #     max_tokens=settings.max_tokens
-        # )
-        self.llm = ChatMistralAI(
-            model="mistral-large-latest",
-            temperature=0,
-            max_retries=2,
-            client=skipsslclient
-            # other params...
+        self.llm = ChatOpenAI(
+            openai_api_key=settings.openai_api_key,
+            model_name=settings.model_name,
+            temperature=settings.temperature,
+            max_tokens=settings.max_tokens
         )
+        # self.llm = ChatMistralAI(
+        #     model="mistral-large-latest",
+        #     temperature=0,
+        #     max_retries=2,
+        #     client=skipsslclient
+        #     # other params...
+        # )
         self.memory = ChatMessageHistory()
         self.system_prompt = system_prompt
     
