@@ -17,10 +17,18 @@ class Settings(BaseSettings):
     model_name: str = "gpt-3.5-turbo"
     max_tokens: int = 1000
     temperature: float = 0.7
+    
+    # LangSmith 설정
+    langsmith_tracing: Optional[str] = None
+    langsmith_endpoint: Optional[str] = None
+    langsmith_api_key: Optional[str] = None
+    langsmith_project: Optional[str] = None
+    
     # client: httpx.Client = skipsslclient
     
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        extra = "ignore"
 
 settings = Settings()
