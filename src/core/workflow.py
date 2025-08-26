@@ -5,15 +5,29 @@ from langsmith import traceable
 from ..agents.security_agent import PromptInjectionDetector
 from ..agents.question_classifier import QuestionClassificationAgent
 from ..agents.output_safety_agent import OutputSafetyAgent
+from ..agents.final_safety_agent import FinalSafetyAgent
+from ..agents.sap_automation_agent import SAPAutomationAgent
 from ..utils.langsmith_config import LangSmithTracker, setup_langsmith
 from .chatbot import Chatbot
 
 class ChatbotState:
     def __init__(self):
         self.user_input: str = ""
-        self.security_check: Dict[str, Any] = {}
         self.response: str = ""
         self.should_block: bool = False
+        self._metadata: Dict[str, Any] = {}
+    
+    def set_metadata(self, key: str, value: Any) -> None:
+        self._metadata[key] = value
+    
+    def get_metadata(self, key: str, default: Any = None) -> Any:
+        return self._metadata.get(key, default)
+    
+    def get_all_metadata(self) -> Dict[str, Any]:
+        return self._metadata.copy()
+    
+    def clear_metadata_except(self, keep_keys: list) -> None:
+        self._metadata = {k: v for k, v in self._metadata.items() if k in keep_keys}
 
 class SecureChatbotWorkflow:
     def __init__(self, system_prompt: str = "You are a helpful AI assistant."):
@@ -22,6 +36,8 @@ class SecureChatbotWorkflow:
         self.security_agent = PromptInjectionDetector()
         self.question_classifier = QuestionClassificationAgent()
         self.output_safety_agent = OutputSafetyAgent()
+        self.final_safety_agent = FinalSafetyAgent()
+        self.sap_automation_agent = SAPAutomationAgent()
         self.chatbot = Chatbot(system_prompt)
         self.tracker = LangSmithTracker("secure_chatbot_workflow")
         self.workflow = self._build_workflow()
@@ -33,7 +49,9 @@ class SecureChatbotWorkflow:
         workflow.add_node("process_message", self._process_message_node)
         workflow.add_node("classify_question", self._classify_question_node)
         workflow.add_node("output_safety_check", self._output_safety_check_node)
+        workflow.add_node("sap_automation", self._sap_automation_node)
         workflow.add_node("generate_response", self._generate_response_node)
+        workflow.add_node("final_safety_check", self._final_safety_check_node)
         
         workflow.set_entry_point("security_check")
         
@@ -53,13 +71,23 @@ class SecureChatbotWorkflow:
             self._route_by_question_type,
             {
                 "faq": "generate_response",
-                "sap_automation": "generate_response",
+                "sap_automation": "sap_automation",
                 "data_request": "output_safety_check"
             }
         )
         
         workflow.add_edge("output_safety_check", "generate_response")
-        workflow.add_edge("generate_response", END)
+        workflow.add_edge("sap_automation", "generate_response")
+        workflow.add_edge("generate_response", "final_safety_check")
+        
+        workflow.add_conditional_edges(
+            "final_safety_check",
+            self._should_block_final_response,
+            {
+                "block": END,
+                "allow": END
+            }
+        )
         
         return workflow.compile()
     
@@ -68,11 +96,12 @@ class SecureChatbotWorkflow:
         user_input = state.get("user_input", "")
         security_result = self.security_agent.detect_injection(user_input)
         
-        state["security_check"] = security_result
         state["should_block"] = security_result["is_malicious"]
-        
         if security_result["is_malicious"]:
             state["response"] = "I cannot process that request as it appears to contain potentially harmful instructions."
+            state["_security_check"] = security_result
+        else:
+            state["_security_check"] = {"is_malicious": False, "confidence": security_result.get("confidence", 0)}
         
         return state
     
@@ -93,11 +122,13 @@ class SecureChatbotWorkflow:
         classification_result = self.question_classifier.classify_with_fallback(sanitized_input)
         
         state["question_type"] = classification_result["question_type"]
-        state["classification_confidence"] = classification_result["confidence"]
-        state["classification_reasoning"] = classification_result["reasoning"]
+        state["_classification"] = {
+            "confidence": classification_result["confidence"],
+            "reasoning": classification_result["reasoning"]
+        }
         
         if "original_classification" in classification_result:
-            state["original_classification"] = classification_result["original_classification"]
+            state["_classification"]["original_classification"] = classification_result["original_classification"]
         
         return state
     
@@ -110,14 +141,46 @@ class SecureChatbotWorkflow:
         
         safety_result = self.output_safety_agent.assess_with_fallback(sanitized_input)
         
-        state["safety_assessment"] = safety_result
         state["output_safety_approved"] = safety_result["safety_level"] == "safe"
+        state["_safety_assessment"] = safety_result
         
-        if safety_result["safety_level"] == "blocked":
-            state["safety_warning"] = f"보안 위험: {safety_result['recommended_action']}"
-        elif safety_result["safety_level"] == "warning":
-            state["safety_warning"] = f"주의 필요: {safety_result['recommended_action']}"
+        if safety_result["safety_level"] != "safe":
+            state["safety_warning"] = f"{'보안 위험' if safety_result['safety_level'] == 'blocked' else '주의 필요'}: {safety_result['recommended_action']}"
         
+        return state
+
+    @traceable(name="sap_automation_node")
+    def _sap_automation_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        sanitized_input = state.get("sanitized_input", "")
+        
+        try:
+            sap_result = self.sap_automation_agent.process_user_request(sanitized_input)
+            
+            if sap_result.success:
+                state["response"] = f"✅ {sap_result.message}\n\n{sap_result.details}"
+            else:
+                state["response"] = f"❌ {sap_result.message}\n\n{sap_result.details}"
+                
+            state["_sap_automation_result"] = {
+                "success": sap_result.success,
+                "message": sap_result.message,
+                "details": sap_result.details
+            }
+            
+        except Exception as e:
+            state["response"] = f"❌ SAP 자동화 처리 중 오류가 발생했습니다: {str(e)}"
+            state["_sap_automation_result"] = {
+                "success": False,
+                "message": "처리 오류",
+                "details": str(e)
+            }
+        
+        return state
+
+    def _cleanup_intermediate_data(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        keys_to_remove = ["sanitized_input", "safety_warning"]
+        for key in keys_to_remove:
+            state.pop(key, None)
         return state
 
     @traceable(name="generate_response_node")
@@ -126,7 +189,11 @@ class SecureChatbotWorkflow:
         question_type = state.get("question_type", "faq")
         output_safety_approved = state.get("output_safety_approved", True)
         
-        safety_assessment = state.get("safety_assessment", {})
+        # SAP 자동화의 경우 이미 응답이 생성되었으므로 그대로 반환
+        if question_type == "sap_automation" and "response" in state:
+            return state
+        
+        safety_assessment = state.get("_safety_assessment", {})
         
         if not output_safety_approved:
             if safety_assessment.get("safety_level") == "blocked":
@@ -141,32 +208,66 @@ class SecureChatbotWorkflow:
             response += f"\n\n⚠️ {state['safety_warning']}"
             
         state["response"] = response
-            
+        
+        return self._cleanup_intermediate_data(state)
+
+    @traceable(name="final_safety_check_node")
+    def _final_safety_check_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        response = state.get("response", "")
+        
+        if not response:
+            return state
+        
+        final_safety_result = self.final_safety_agent.assess_with_fallback(response)
+        
+        state["_final_safety_assessment"] = final_safety_result
+        state["final_response_blocked"] = final_safety_result["safety_level"] == "blocked"
+        
+        if final_safety_result["safety_level"] == "blocked":
+            state["response"] = "죄송합니다. 생성된 응답이 보안 정책에 위배되어 제공할 수 없습니다."
+            state["final_safety_warning"] = f"최종 보안 차단: {final_safety_result['recommended_action']}"
+        elif final_safety_result["safety_level"] == "warning":
+            state["final_safety_warning"] = f"최종 보안 주의: {final_safety_result['recommended_action']}"
+            state["response"] += f"\n\n⚠️ {state['final_safety_warning']}"
+        
         return state
+
+    def _should_block_final_response(self, state: Dict[str, Any]) -> str:
+        return "block" if state.get("final_response_blocked", False) else "allow"
     
     @traceable(name="process_message")
     def process_message(self, user_input: str) -> Dict[str, Any]:
+        from datetime import datetime
+        
         initial_state = {
             "user_input": user_input,
             "security_check": {},
             "response": "",
-            "should_block": False
+            "should_block": False,
+            "timestamp": datetime.now().isoformat()
         }
         
-        result = self.workflow.invoke(initial_state)
-        
-        return {
-            "response": result["response"],
-            "security_check": result["security_check"],
-            "blocked": result["should_block"],
-            "classification": {
-                "question_type": result.get("question_type"),
-                "confidence": result.get("classification_confidence"),
-                "reasoning": result.get("classification_reasoning"),
-                "original_classification": result.get("original_classification")
-            },
-            "safety_assessment": result.get("safety_assessment", {})
-        }
+        try:
+            result = self.workflow.invoke(initial_state)
+            
+            classification = result.get("_classification", {})
+            return {
+                "response": result["response"],
+                "security_check": result.get("_security_check", {}),
+                "blocked": result["should_block"],
+                "classification": {
+                    "question_type": result.get("question_type"),
+                    "confidence": classification.get("confidence"),
+                    "reasoning": classification.get("reasoning"),
+                    "original_classification": classification.get("original_classification")
+                },
+                "safety_assessment": result.get("_safety_assessment", {}),
+                "final_safety_assessment": result.get("_final_safety_assessment", {}),
+                "final_response_blocked": result.get("final_response_blocked", False),
+                "sap_automation_result": result.get("_sap_automation_result", {})
+            }
+        except Exception as e:
+            raise
     
     def clear_history(self):
         self.chatbot.clear_history()

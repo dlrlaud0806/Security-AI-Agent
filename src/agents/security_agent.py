@@ -23,13 +23,7 @@ class PromptInjectionDetector:
             temperature=0.1,
             max_tokens=100
         )
-        # self.llm = ChatMistralAI(
-        #     model="mistral-large-latest",
-        #     temperature=0,
-        #     max_retries=2,
-        #     client=skipsslclient
-        #     # other params...
-        # )
+
         
         self.injection_patterns = [
             r"ignore\s+previous\s+instructions",
