@@ -91,6 +91,39 @@ class SecureChatbotWorkflow:
         
         return workflow.compile()
     
+    def _check_input_length(self, user_input: str) -> Dict[str, Any]:
+        """입력 길이 검사를 수행하는 단순 함수"""
+        max_length = 300
+        input_length = len(user_input)
+        
+        if input_length > max_length:
+            return {
+                "response": f"입력이 너무 깁니다. 최대 {max_length}자까지 입력 가능합니다. (현재: {input_length}자)\n간단하고 명확하게 질문해 주세요.",
+                "blocked": True,
+                "length_check": {
+                    "blocked": True,
+                    "length": input_length,
+                    "max_length": max_length,
+                    "reason": "입력 길이 제한 초과"
+                },
+                "security_check": {},
+                "classification": {},
+                "safety_assessment": {},
+                "final_safety_assessment": {},
+                "final_response_blocked": False,
+                "sap_automation_result": {}
+            }
+        
+        return {
+            "blocked": False,
+            "length_check": {
+                "blocked": False,
+                "length": input_length,
+                "max_length": max_length,
+                "reason": "입력 길이 적정"
+            }
+        }
+    
     @traceable(name="security_check_node")
     def _security_check_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
         user_input = state.get("user_input", "")
@@ -239,6 +272,12 @@ class SecureChatbotWorkflow:
     def process_message(self, user_input: str) -> Dict[str, Any]:
         from datetime import datetime
         
+        # 1. 최우선 길이 체크 (가장 빠른 차단, 보안 체크 이전)
+        length_check_result = self._check_input_length(user_input)
+        if length_check_result["blocked"]:
+            return length_check_result
+        
+        # 2. LangGraph 보안 워크플로우 실행
         initial_state = {
             "user_input": user_input,
             "security_check": {},
@@ -253,6 +292,7 @@ class SecureChatbotWorkflow:
             classification = result.get("_classification", {})
             return {
                 "response": result["response"],
+                "length_check": length_check_result["length_check"],  # 길이 체크 결과 포함
                 "security_check": result.get("_security_check", {}),
                 "blocked": result["should_block"],
                 "classification": {

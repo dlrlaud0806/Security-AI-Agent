@@ -4,6 +4,7 @@ from langchain.schema import HumanMessage, SystemMessage
 from langchain.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
 from langsmith import traceable
+import re
 from ..config.settings import settings
 from ..utils.langsmith_config import LangSmithTracker
 
@@ -23,6 +24,26 @@ class QuestionClassificationAgent:
         )
         self.parser = PydanticOutputParser(pydantic_object=ClassificationResult)
         self.tracker = LangSmithTracker("question_classifier")
+        
+        # 확실한 키워드 패턴 (높은 신뢰도로 즉시 분류 가능)
+        self.confident_patterns = {
+            "sap_automation": [
+                r"락\s*해제", r"unlock", r"se\d+", r"tcode", 
+                r"sap\s*(gui|시스템)", r"비밀번호\s*초기화",
+                r"주문\s*(생성|자동화)", r"워크플로우", r"프로세스\s*자동화"
+            ],
+            "data_request": [
+                r"(조회|검색|리스트)\s*(해|해줘|주세요)", 
+                r"데이터\s*(보여|알려|가져)", r"정보\s*(필요|요청)",
+                r"매출\s*데이터", r"사용자\s*(정보|리스트)",
+                r"권한\s*(보유|가진)\s*사용자", r"통계\s*(보여|알려)"
+            ],
+            "faq": [
+                r"(어떻게|how)\s*(사용|use)", r"도움말", r"사용법",
+                r"뭔가요\?", r"what\s*is", r"에러", r"오류",
+                r"문제", r"안\s*돼", r"작동", r"기능"
+            ]
+        }
         
         self.system_prompt = """당신은 사용자 질문을 다음 3가지 카테고리로 분류하는 전문가입니다:
 
@@ -65,16 +86,40 @@ class QuestionClassificationAgent:
                 reasoning=f"분류 중 오류 발생: {str(e)}, 기본값으로 faq 반환"
             )
     
+    def _confident_keyword_classification(self, question: str) -> Dict[str, Any]:
+        """확실한 키워드 패턴으로 즉시 분류 (LLM 호출 스킵)"""
+        question_lower = question.lower()
+        
+        for category, patterns in self.confident_patterns.items():
+            for pattern in patterns:
+                if re.search(pattern, question, re.IGNORECASE):
+                    return {
+                        "question_type": category,
+                        "confidence": 0.85,
+                        "reasoning": f"확실한 키워드 패턴 매칭: '{pattern}' → {category}",
+                        "method": "keyword_priority"
+                    }
+        
+        return {"confidence": 0.0, "method": "keyword_priority"}
+
     @traceable(name="classify_with_fallback")
     def classify_with_fallback(self, question: str) -> Dict[str, Any]:
+        # 1. 우선적으로 확실한 키워드 패턴 체크 (빠른 처리)
+        confident_result = self._confident_keyword_classification(question)
+        if confident_result["confidence"] > 0.8:
+            return confident_result  # LLM 호출 스킵!
+        
+        # 2. 애매한 경우만 LLM 호출
         result = self.classify_question(question)
         
+        # 3. LLM 신뢰도도 낮으면 기존 fallback 사용
         if result.confidence < 0.3:
             fallback_result = self._fallback_classification(question)
             return {
                 "question_type": fallback_result,
                 "confidence": 0.5,
                 "reasoning": f"LLM 분류 신뢰도 낮음({result.confidence:.2f}), 키워드 기반 폴백 사용",
+                "method": "llm_fallback",
                 "original_classification": {
                     "type": result.question_type,
                     "confidence": result.confidence,
@@ -85,7 +130,8 @@ class QuestionClassificationAgent:
         return {
             "question_type": result.question_type,
             "confidence": result.confidence,
-            "reasoning": result.reasoning
+            "reasoning": result.reasoning,
+            "method": "llm_primary"
         }
     
     def _fallback_classification(self, question: str) -> QuestionType:
