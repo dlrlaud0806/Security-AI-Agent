@@ -4,7 +4,6 @@ from langchain.schema import BaseMessage
 from langsmith import traceable
 from ..agents.security_agent import PromptInjectionDetector
 from ..agents.question_classifier import QuestionClassificationAgent
-from ..agents.output_safety_agent import OutputSafetyAgent
 from ..agents.final_safety_agent import FinalSafetyAgent
 from ..agents.sap_automation_agent import SAPAutomationAgent
 from ..utils.langsmith_config import LangSmithTracker, setup_langsmith
@@ -30,14 +29,18 @@ class ChatbotState:
         self._metadata = {k: v for k, v in self._metadata.items() if k in keep_keys}
 
 class SecureChatbotWorkflow:
-    def __init__(self, system_prompt: str = "You are a helpful AI assistant."):
+    def __init__(self, system_prompt: str = "You are a helpful AI assistant.", debug_mode: bool = None):
         setup_langsmith()
         
-        self.security_agent = PromptInjectionDetector()
+        # 디버그 모드 설정
+        if debug_mode is None:
+            import os
+            debug_mode = os.getenv('SECURITY_DEBUG_MODE', 'false').lower() == 'true'
+        
+        self.security_agent = PromptInjectionDetector(debug_mode=debug_mode)
         self.question_classifier = QuestionClassificationAgent()
-        self.output_safety_agent = OutputSafetyAgent()
         self.final_safety_agent = FinalSafetyAgent()
-        self.sap_automation_agent = SAPAutomationAgent()
+        self.sap_automation_agent = SAPAutomationAgent(debug_mode=debug_mode)
         self.chatbot = Chatbot(system_prompt)
         self.tracker = LangSmithTracker("secure_chatbot_workflow")
         self.workflow = self._build_workflow()
@@ -48,7 +51,6 @@ class SecureChatbotWorkflow:
         workflow.add_node("security_check", self._security_check_node)
         workflow.add_node("process_message", self._process_message_node)
         workflow.add_node("classify_question", self._classify_question_node)
-        workflow.add_node("output_safety_check", self._output_safety_check_node)
         workflow.add_node("sap_automation", self._sap_automation_node)
         workflow.add_node("generate_response", self._generate_response_node)
         workflow.add_node("final_safety_check", self._final_safety_check_node)
@@ -72,12 +74,11 @@ class SecureChatbotWorkflow:
             {
                 "faq": "generate_response",
                 "sap_automation": "sap_automation",
-                "data_request": "output_safety_check"
+                "data_request": "generate_response"
             }
         )
         
-        workflow.add_edge("output_safety_check", "generate_response")
-        workflow.add_edge("sap_automation", "generate_response")
+        workflow.add_edge("sap_automation", END)  # SAP는 자체 보안 검증 후 바로 종료
         workflow.add_edge("generate_response", "final_safety_check")
         
         workflow.add_conditional_edges(
@@ -108,7 +109,6 @@ class SecureChatbotWorkflow:
                 },
                 "security_check": {},
                 "classification": {},
-                "safety_assessment": {},
                 "final_safety_assessment": {},
                 "final_response_blocked": False,
                 "sap_automation_result": {}
@@ -168,19 +168,6 @@ class SecureChatbotWorkflow:
     def _route_by_question_type(self, state: Dict[str, Any]) -> str:
         return state.get("question_type", "faq")
     
-    @traceable(name="output_safety_check_node")
-    def _output_safety_check_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        sanitized_input = state.get("sanitized_input", "")
-        
-        safety_result = self.output_safety_agent.assess_with_fallback(sanitized_input)
-        
-        state["output_safety_approved"] = safety_result["safety_level"] == "safe"
-        state["_safety_assessment"] = safety_result
-        
-        if safety_result["safety_level"] != "safe":
-            state["safety_warning"] = f"{'보안 위험' if safety_result['safety_level'] == 'blocked' else '주의 필요'}: {safety_result['recommended_action']}"
-        
-        return state
 
     @traceable(name="sap_automation_node")
     def _sap_automation_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -220,26 +207,13 @@ class SecureChatbotWorkflow:
     def _generate_response_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
         sanitized_input = state.get("sanitized_input", "")
         question_type = state.get("question_type", "faq")
-        output_safety_approved = state.get("output_safety_approved", True)
         
         # SAP 자동화의 경우 이미 응답이 생성되었으므로 그대로 반환
         if question_type == "sap_automation" and "response" in state:
             return state
         
-        safety_assessment = state.get("_safety_assessment", {})
-        
-        if not output_safety_approved:
-            if safety_assessment.get("safety_level") == "blocked":
-                state["response"] = "죄송합니다. 보안상 위험한 요청으로 판단되어 처리할 수 없습니다."
-            else:
-                state["response"] = "죄송합니다. 민감한 정보와 관련된 요청은 처리할 수 없습니다."
-            return state
-        
+        # 일반적인 응답 생성
         response = self.chatbot.chat(sanitized_input)
-        
-        if state.get("safety_warning"):
-            response += f"\n\n⚠️ {state['safety_warning']}"
-            
         state["response"] = response
         
         return self._cleanup_intermediate_data(state)
@@ -301,7 +275,6 @@ class SecureChatbotWorkflow:
                     "reasoning": classification.get("reasoning"),
                     "original_classification": classification.get("original_classification")
                 },
-                "safety_assessment": result.get("_safety_assessment", {}),
                 "final_safety_assessment": result.get("_final_safety_assessment", {}),
                 "final_response_blocked": result.get("final_response_blocked", False),
                 "sap_automation_result": result.get("_sap_automation_result", {})

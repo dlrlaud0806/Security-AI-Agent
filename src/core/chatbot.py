@@ -42,7 +42,7 @@ class Chatbot:
         
         messages.append(HumanMessage(content=message))
         
-        response = self.llm(messages)
+        response = self.llm.invoke(messages)
         
         self.memory.add_user_message(message)
         self.memory.add_ai_message(response.content)
